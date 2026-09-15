@@ -34,6 +34,7 @@ import numpy as np
 import sounddevice as sd
 import webrtcvad
 
+from backtalk import latency
 from backtalk.config import CFG
 from backtalk.vlog import log
 
@@ -412,13 +413,18 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
         while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
             block, _ = stream.read(FRAME_LEN)
             frames.append(block[:, 0].copy())
+        token = latency.turn_start()   # [lat] PTT release detected; mints this turn's token
         # a small tail so the last word isn't clipped at release
         for _ in range(6):
             block, _ = stream.read(FRAME_LEN)
             frames.append(block[:, 0].copy())
+    latency.mark("recording_complete", token)
     if len(frames) * FRAME_MS / 1000 < min_s:
         return None
-    return transcribe(np.concatenate(frames))
+    latency.mark("stt_start", token)
+    text = transcribe(np.concatenate(frames))
+    latency.mark("stt_complete", token)
+    return text
 
 
 if __name__ == "__main__":

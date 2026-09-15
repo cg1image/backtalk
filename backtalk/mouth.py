@@ -50,6 +50,7 @@ import threading
 import numpy as np
 import sounddevice as sd
 
+from backtalk import latency
 from backtalk.config import CFG
 from backtalk.vlog import log
 
@@ -181,13 +182,14 @@ def split_sentences(text: str) -> list[str]:
     return parts or ([text.strip()] if text.strip() else [])
 
 
-def _stream_kokoro(text: str):
+def _stream_kokoro(text: str, token=None):
     """One sentence -> int16 PCM chunks at 24kHz, in-process."""
     pipe = warm()
     try:
         speed = float(CFG.get("speed") or 1.0)
     except (TypeError, ValueError):
         speed = 1.0
+    latency.mark("tts_synth_start", token)
     for _, _, audio in pipe(text, voice=CFG["voice"], speed=speed):
         a = np.asarray(audio, dtype=np.float32)
         if a.size:
@@ -316,7 +318,7 @@ def _elevenlabs_ready() -> bool:
                 and _get_elevenlabs_key())
 
 
-def synth_stream(text: str, timeout: float = 30.0):
+def synth_stream(text: str, timeout: float = 30.0, token=None):
     """One sentence -> yields (sample_rate, pcm_chunk) as the TTS
     renders. ElevenLabs when configured, Kokoro otherwise — and Kokoro
     as the fallback on ANY ElevenLabs failure. Degrade, never mute."""
@@ -328,7 +330,7 @@ def synth_stream(text: str, timeout: float = 30.0):
         except Exception as e:
             log(f"[mouth] elevenlabs failed ({str(e)[:60]}) — "
                 f"falling back to {CFG['voice']}")
-    for pcm in _stream_kokoro(text):
+    for pcm in _stream_kokoro(text, token=token):
         yield KOKORO_RATE, pcm
 
 
@@ -351,21 +353,29 @@ class Mouth:
         return self._speaking.is_set()
 
     def say(self, text: str):
-        """Queue text (split to sentences) for speech."""
+        """Queue text (split to sentences) for speech. Not tied to any
+        PTT turn (greeting, permission asks, console replies) — always
+        queued with token=None, so it can never be mistaken for, or
+        close out, a real turn's latency window."""
         for s in split_sentences(text):
-            self._q.put((s, None))
+            self._q.put((s, None, None))
 
-    def say_chunk(self, text: str, directions=None):
+    def say_chunk(self, text: str, directions=None, token=None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
         chunks get livelier prosody (single short sentences come out
         dull).
 
         `directions` are the stage directions this chunk carried. They are
         published on the signal bus when this chunk's audio STARTS, which
-        is why they travel with it instead of firing at parse time."""
+        is why they travel with it instead of firing at parse time.
+
+        `token` is the calling turn's latency ownership token (diagnostic
+        only — see latency.py). It travels with the queued text across
+        the thread handoff to the worker below exactly like `directions`
+        already does, rather than being rediscovered later."""
         text = text.strip()
         if text:
-            self._q.put((text, directions or None))
+            self._q.put((text, directions or None, token))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
@@ -395,7 +405,10 @@ class Mouth:
         from backtalk import signals
         while True:
             item = self._q.get()
-            sentence, directions = item if isinstance(item, tuple) else (item, None)
+            if isinstance(item, tuple):
+                sentence, directions, token = item
+            else:
+                sentence, directions, token = item, None, None
             if not sentence:
                 continue
             self._stop.clear()
@@ -404,7 +417,7 @@ class Mouth:
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_stream(sentence, directions)
+                self._play_stream(sentence, directions, token)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
@@ -413,6 +426,13 @@ class Mouth:
                     # The reply has genuinely stopped talking, as opposed to
                     # the gap between two sentences of the same reply.
                     signals.reply_done()
+                    # self._stop is only ever set by shut_up() (barge-in,
+                    # quit, shutdown) and is cleared at the top of THIS
+                    # loop before each item plays, so if it's still set
+                    # here it was set during this exact chunk's playback,
+                    # never a leftover from an earlier, already-closed turn.
+                    reason = "cancelled" if self._stop.is_set() else "completed"
+                    latency.turn_end(reason, token)
                     self.ducker.speech_end()
                     signals.set_state("idle")
 
@@ -465,18 +485,19 @@ class Mouth:
         self._out = None
         self._out_rate = None
 
-    def _play_stream(self, sentence: str, directions=None, block: int = 2205,
-                     prebuffer_s: float = 0.75):
+    def _play_stream(self, sentence: str, directions=None, token=None,
+                     block: int = 2205, prebuffer_s: float = 0.75):
         """Stream-synthesize and play with the head-start buffer (audio
         law #2). stop() reacts ~50ms. The sample rate comes from
         whichever engine actually answered."""
         from backtalk import signals
-        gen = synth_stream(sentence)
+        gen = synth_stream(sentence, token=token)
         head: list = []
         banked = 0
         rate = None
         for rate_, pcm in gen:
             rate = rate_
+            latency.mark("first_pcm_ready", token)
             head.append(pcm)
             banked += len(pcm)
             if banked >= int(rate * prebuffer_s):
@@ -497,6 +518,7 @@ class Mouth:
                     if self._stop.is_set():
                         return False
                     out.write(pcm[i:i + block])
+                    latency.mark("first_pcm_submitted", token)
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".

@@ -41,11 +41,44 @@ try:
 except ImportError:                       # older SDKs: nothing to silence
     CanUseToolShadowedWarning = None
 
-from backtalk import signals
+from backtalk import latency, signals
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+# FIRST-CHUNK-ONLY clause splitting (diagnostic experiment): a comma,
+# semicolon, colon, em dash, or en dash followed by whitespace, never a
+# plain hyphen-minus (that would also match inside compounds like
+# "well-known" — except it can't, since there's never whitespace right
+# after that hyphen; excluded anyway per explicit instruction). Used
+# ONLY for the first yield of a turn, gated by size, so an early clause
+# gets spoken sooner without ever forcing a fragment that is too short
+# or a cut with no qualifying punctuation in sight.
+_CLAUSE_END = re.compile(r"(?<=[,;:—–])\s")
+_FIRST_CHUNK_MIN = 20    # chars; below this, a clause cut is skipped
+_FIRST_CHUNK_MAX = 140   # chars; beyond this, stop waiting for a clause
+
+
+def _first_boundary(buf: str):
+    """The first chunk's cut point only: the earliest clause boundary
+    that clears _FIRST_CHUNK_MIN and stays within _FIRST_CHUNK_MAX, else
+    the next sentence end — today's rule, always eligible and never
+    bounded. None if neither has arrived yet (caller keeps buffering).
+
+    Walks every clause mark in order rather than just the first: a
+    string can carry an early throwaway comma ("Well, here's the
+    thing, ...") that's too short to use alone, and a later one in the
+    SAME sentence may still be a perfectly good cut — skip forward
+    instead of giving up on the first miss."""
+    sm = _SENTENCE_END.search(buf)
+    for cm in _CLAUSE_END.finditer(buf):
+        end = cm.end()
+        if end < _FIRST_CHUNK_MIN:
+            continue
+        if end <= _FIRST_CHUNK_MAX and (sm is None or end < sm.end()):
+            return end
+        break    # earliest qualifying candidate already lost; later ones only worse
+    return sm.end() if sm else None
 
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
@@ -308,27 +341,38 @@ class WarmBrain:
             await self._client.disconnect()
             self._client = None
 
-    async def ask_stream(self, utterance: str):
-        """Yield complete sentences as they stream out of the model."""
+    async def ask_stream(self, utterance: str, token=None):
+        """Yield complete sentences as they stream out of the model.
+        `token` is the calling turn's latency ownership token (None
+        for untracked calls like the startup warmup ping) — carried
+        through, never rediscovered, per latency.mark()'s contract."""
         self._dirty = True             # in flight until its ResultMessage
+        latency.mark("claude_dispatch", token)
         await self._client.query(utterance)
         buf = ""
+        first_emitted = False    # first-chunk-only clause splitting
         async for msg in self._client.receive_response():
             t = type(msg).__name__
             if t == "StreamEvent":
                 ev = getattr(msg, "event", {}) or {}
                 if ev.get("type") == "content_block_delta":
+                    latency.mark("first_token", token)
                     delta = ev.get("delta", {}) or {}
                     if delta.get("type") == "text_delta":
                         buf += delta.get("text", "")
-                        # emit any complete sentences
+                        # emit any complete sentences (or, for the very
+                        # first chunk only, an earlier clause boundary)
                         while True:
-                            m = _SENTENCE_END.search(buf)
-                            if not m:
+                            if not first_emitted:
+                                end = _first_boundary(buf)
+                            else:
+                                m = _SENTENCE_END.search(buf)
+                                end = m.end() if m else None
+                            if end is None:
                                 break
-                            sentence, buf = (buf[:m.end()].strip(),
-                                             buf[m.end():])
+                            sentence, buf = buf[:end].strip(), buf[end:]
                             if sentence:
+                                first_emitted = True
                                 yield sentence
                 elif ev.get("type") == "content_block_stop":
                     # End of a speech block (e.g. right before a tool
@@ -340,6 +384,7 @@ class WarmBrain:
                     tail = buf.strip()
                     buf = ""
                     if tail:
+                        first_emitted = True
                         yield tail
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned

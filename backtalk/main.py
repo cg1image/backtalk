@@ -61,7 +61,7 @@ import sys
 import threading
 import time
 
-from backtalk import signals
+from backtalk import latency, signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
@@ -579,10 +579,13 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, token=None):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat). `token` is this turn's latency
+    ownership token (None for typed/console-originated turns) — carried
+    through to every mark()/turn_end() call and into the mouth queue,
+    never rediscovered from shared state."""
     t0 = time.time()
     first = True
     batch: list[str] = []
@@ -606,31 +609,34 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if not s:
             return
         if first:
+            latency.mark("first_chunk", token)
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
+            mouth.say_chunk(s, pending, token)
             pending = []
             first = False
         else:
             log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
             batch.append(s)
             if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch), pending)
+                mouth.say_chunk(" ".join(batch), pending, token)
                 pending = []
                 batch = []
 
     try:
-        async for sentence in brain.ask_stream(text):
+        async for sentence in brain.ask_stream(text, token):
             emit(sentence)
         if batch:
-            mouth.say_chunk(" ".join(batch), pending)
+            mouth.say_chunk(" ".join(batch), pending, token)
             pending = []
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing
             # will ever dequeue, so nothing resets the bus — park it here.
             signals.static_stop()
             signals.set_state("idle")
+            latency.turn_end("empty", token)
     except asyncio.CancelledError:
+        latency.turn_end("cancelled", token)
         try:
             await brain.interrupt()
         except Exception:
@@ -691,8 +697,11 @@ async def amain():
         await asyncio.wait_for(brain.start(), 120)
 
         async def _warmup():
+            # token=None explicitly: this is plumbing, not a real turn,
+            # and must never be attributed to one.
             async for _ in brain.ask_stream(
-                    "Warmup ping - reply with the single word: ready"):
+                    "Warmup ping - reply with the single word: ready",
+                    None):
                 pass
         await asyncio.wait_for(_warmup(), 180)
     except (Exception, asyncio.TimeoutError) as e:
@@ -856,10 +865,14 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None,
+                     token=None) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
-        told apart from speech that began before the ask even existed."""
+        told apart from speech that began before the ask even existed.
+        `token` is this turn's latency ownership token, captured by the
+        PTT press path right after record_held() returns; typed and
+        open-mic callers omit it, leaving it None."""
         nonlocal speak_task
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
@@ -933,7 +946,7 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        speak_task = asyncio.create_task(speak_reply(brain, mouth, text, token))
         return True
 
     try:
@@ -1022,9 +1035,20 @@ async def amain():
                 mouth.ducker.speech_start()      # duck NOW, while you talk
                 print("[ptt] recording (release to send)...", flush=True)
                 _MIC["btn"] = True               # open mic yields to the button
+                token = None
                 try:
                     text = await loop.run_in_executor(
                         None, lambda: record_held(ptt.is_held))
+                    # Captured immediately after record_held() returns:
+                    # that function is the ONLY caller of
+                    # latency.turn_start(), and this is still the same
+                    # single-threaded dispatch path that awaited it, so
+                    # nothing else could have minted a newer token in
+                    # between. This is the exact value turn_start() just
+                    # returned inside record_held() -- fetched here
+                    # rather than threading a changed return shape back
+                    # through record_held() itself.
+                    token = latency.current_token()
                 except Exception as e:
                     # A device-level failure gets plain words instead of a
                     # raw exception. The pre-flight at startup cannot catch
@@ -1047,7 +1071,7 @@ async def amain():
                     log("[ptt] (tap or empty — ignored)")
                     signals.set_state("idle")
                     continue
-                if not await handle(text, spoke_from=press_t):
+                if not await handle(text, spoke_from=press_t, token=token):
                     return
     except KeyboardInterrupt:
         pass
